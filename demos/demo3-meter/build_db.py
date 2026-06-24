@@ -6,7 +6,8 @@ import glob
 import json
 import os
 import sqlite3
-from collections import Counter, defaultdict
+from collections import defaultdict
+from typing import Optional
 
 import finops_core as fc
 
@@ -14,6 +15,13 @@ WORK = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(WORK, "finops.db")
 LOG_DIR = os.path.expanduser(os.environ.get("COPILOT_LOG_DIR", "~/.copilot/logs"))
 STATE_DIR = os.path.expanduser(os.environ.get("COPILOT_SESSION_STATE_DIR", "~/.copilot/session-state"))
+VSCODE_WORKSPACE_STORAGE_DIR = os.path.expanduser(
+    os.environ.get(
+        "VSCODE_WORKSPACE_STORAGE_DIR",
+        os.path.join(os.environ.get("APPDATA", ""), "Code", "User", "workspaceStorage"),
+    )
+)
+SOURCE_MODE = (os.environ.get("FINOPS_SOURCE_MODE", "both") or "both").strip().lower()
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -28,6 +36,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE sessions (
             session_id TEXT PRIMARY KEY,
             source TEXT NOT NULL,
+            developer TEXT,
             models TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -119,13 +128,14 @@ def upsert_session(conn: sqlite3.Connection, session: dict) -> None:
     conn.execute(
         """
         INSERT OR REPLACE INTO sessions (
-            session_id, source, models, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+            session_id, source, developer, models, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
             total_tokens, nano_aiu, aiu, usd, credits, premium_requests, responses, tool_call_count,
             start_time, end_time, cwd, repository, selected_model, events_path, source_logs, has_shutdown
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            session["session_id"], session.get("source") or "events_no_cost", session.get("model_names") or session.get("selected_model"),
+            session["session_id"], session.get("source") or "events_no_cost", session.get("developer"),
+            session.get("model_names") or session.get("selected_model"),
             tokens.get("input", 0), tokens.get("output", 0), tokens.get("cache_read", 0), tokens.get("cache_write", 0),
             total_tokens, session.get("nano_aiu"), session.get("aiu"), session.get("usd") or 0.0,
             session.get("credits") or 0.0, session.get("premium_requests"), session.get("responses") or 0,
@@ -228,30 +238,87 @@ def load_raw_log_sessions() -> dict:
     }, parse_errors
 
 
+def load_vscode_chatsessions() -> tuple:
+    per_session_records = defaultdict(list)
+    source_logs = defaultdict(set)
+    parse_errors = []
+    for path in glob.glob(os.path.join(VSCODE_WORKSPACE_STORAGE_DIR, "*", "chatSessions", "*.jsonl")):
+        try:
+            records = fc.parse_copilot_chatsessions_jsonl(path)
+        except Exception as exc:  # keep demo resilient to partial logs
+            parse_errors.append({"path": path, "error": str(exc)})
+            continue
+        for record in records:
+            sid = record.get("session_id")
+            if not sid:
+                continue
+            per_session_records[sid].append(record)
+            source_logs[sid].add(path)
+    return {
+        sid: fc.session_from_log_records(sid, records, sorted(source_logs[sid]))
+        for sid, records in per_session_records.items()
+    }, parse_errors
+
+
 def main() -> int:
-    event_sessions = load_event_sessions()
-    raw_sessions, parse_errors = load_raw_log_sessions()
+    classic = SOURCE_MODE in {"classic", "both"}
+    vscode = SOURCE_MODE in {"vscode", "both"}
+
+    event_sessions = load_event_sessions() if classic else {}
+    raw_sessions, parse_errors = load_raw_log_sessions() if classic else ({}, [])
+    chatsessions, chatsessions_errors = load_vscode_chatsessions() if vscode else ({}, [])
+
     # Prefer shutdown events when they contain cost-bearing model metrics. Use raw logs for no-shutdown/live sessions.
     merged = dict(event_sessions)
-    for sid, raw in raw_sessions.items():
-        existing = merged.get(sid)
-        if not existing or not existing.get("has_shutdown") or not (existing.get("usd") or 0):
+
+    def merge_sessions(incoming: dict, relabel_source: Optional[str] = None) -> None:
+        for sid, raw in incoming.items():
+            existing = merged.get(sid)
+            if existing and existing.get("has_shutdown") and (existing.get("usd") or 0):
+                continue
             if existing:
-                raw.update({k: existing.get(k) for k in ("events_path", "start_time", "end_time", "cwd", "repository", "selected_model", "tool_call_count", "invocation_counts", "has_shutdown") if existing.get(k) is not None})
+                raw.update(
+                    {
+                        k: existing.get(k)
+                        for k in (
+                            "events_path",
+                            "start_time",
+                            "end_time",
+                            "cwd",
+                            "repository",
+                            "selected_model",
+                            "developer",
+                            "tool_call_count",
+                            "invocation_counts",
+                            "has_shutdown",
+                        )
+                        if existing.get(k) is not None
+                    }
+                )
                 if existing.get("events_path"):
                     raw["skill_windows"] = fc.compute_skill_windows(fc.read_events_file(existing["events_path"]), raw)
+            if relabel_source and raw.get("source") == "raw_log":
+                raw["source"] = relabel_source
             merged[sid] = raw
+
+    merge_sessions(raw_sessions)
+    merge_sessions(chatsessions, relabel_source="chatsessions")
+
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
     for session in merged.values():
         upsert_session(conn, session)
     meta = {
+        "source_mode": SOURCE_MODE,
         "state_dir": STATE_DIR,
         "log_dir": LOG_DIR,
+        "vscode_workspace_storage_dir": VSCODE_WORKSPACE_STORAGE_DIR,
         "event_sessions": len(event_sessions),
         "raw_log_sessions": len(raw_sessions),
+        "vscode_chatsessions": len(chatsessions),
         "merged_sessions": len(merged),
         "raw_log_parse_errors": parse_errors,
+        "chatsessions_parse_errors": chatsessions_errors,
         "credit_usd": fc.CREDIT_USD,
         "tool_attribution_method": "Tools keep measured invocation counts and distinct sessions; dashboard dollars are metered session cost where the tool ran, not per-tool attribution.",
         "skill_window_method": "Skill windows open at skill.invoked and close at the EARLIEST of the next skill.invoked, the next HUMAN user.message (source absent or 'user'; synthetic skill-context/autopilot messages are ignored), or session end. A new skill overtakes the prior one, so windows do NOT overlap. window_output_tokens are MEASURED assistant.message outputTokens summed per model (including subagent turns on other models that do not themselves emit a skill.invoked). window_input/cache_read/cache_write_tokens, window_usd_est and window_credits_est are MODELED: each model's metered session totals apportioned by the window's output share, with denominator max(metered_output, sum_window_output) as a safety cap.",

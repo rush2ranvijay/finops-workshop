@@ -57,7 +57,6 @@ def load_titles():
 
 def main() -> int:
     conn = sqlite3.connect(DB_PATH)
-    meta = {r["key"]: json.loads(r["value"]) for r in rows(conn, "SELECT key, value FROM etl_metadata")}
     top_sessions = rows(
         conn,
         """

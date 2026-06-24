@@ -41,6 +41,34 @@ def canonical_model(model: str) -> str:
     return model.replace(".", "-")
 
 
+def as_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or isinstance(value, bool):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def safe_get(dct: Any, *path: str) -> Any:
+    cur = dct
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
 def zero_tokens() -> Dict[str, int]:
     return {k: 0 for k in TOKEN_TYPES}
 
@@ -216,6 +244,169 @@ def parse_copilot_usage_log(path: str, target_session: Optional[str] = None) -> 
     return records
 
 
+def _record_from_chatsession_request(
+    req_item: Any,
+    idx: int,
+    path: str,
+    session_id: Optional[str],
+    model_hint: str,
+    target_session: Optional[str],
+    session_start_hint: Optional[str],
+    developer: str,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(req_item, dict):
+        return None
+    req_session = str(req_item.get("sessionId") or session_id or "")
+    if not req_session:
+        return None
+    if target_session is not None and req_session != target_session:
+        return None
+
+    result = req_item.get("result") or {}
+    metadata = result.get("metadata") or {} if isinstance(result, dict) else {}
+
+    completion_tokens = as_int(
+        first_non_empty(
+            metadata.get("completionTokens"),
+            metadata.get("outputTokens"),
+            req_item.get("completionTokens"),
+            req_item.get("outputTokens"),
+        ),
+        0,
+    )
+    prompt_tokens = as_int(
+        first_non_empty(
+            metadata.get("promptTokens"),
+            metadata.get("inputTokens"),
+            req_item.get("promptTokens"),
+            req_item.get("inputTokens"),
+        ),
+        0,
+    )
+    cache_creation_tokens = as_int(
+        first_non_empty(metadata.get("cacheCreationTokens"), req_item.get("cacheCreationTokens")),
+        0,
+    )
+    cache_read_tokens = as_int(
+        first_non_empty(metadata.get("cacheReadTokens"), req_item.get("cacheReadTokens")),
+        0,
+    )
+
+    if prompt_tokens + completion_tokens + cache_creation_tokens + cache_read_tokens <= 0:
+        return None
+
+    req_model = canonical_model(
+        str(
+            (req_item.get("agent") or {}).get("model")
+            or req_item.get("modelId")
+            or metadata.get("model")
+            or (req_item.get("metadata") or {}).get("model")
+            or model_hint
+            or "unknown"
+        )
+    )
+    ts_iso = iso_from_millis(
+        first_non_empty(
+            req_item.get("timestamp"),
+            metadata.get("timestamp"),
+            safe_get(req_item, "response", "timestamp"),
+        )
+    )
+
+    out = {
+        "line": idx,
+        "session_id": req_session,
+        "model": req_model,
+        "tokens": {
+            "input": prompt_tokens,
+            "output": completion_tokens,
+            "cache_read": cache_read_tokens,
+            "cache_write": cache_creation_tokens,
+        },
+        "nano_aiu": None,
+        "source_log": path,
+        "timestamp": ts_iso,
+        "session_start_hint": session_start_hint,
+    }
+    if developer:
+        out["developer"] = developer
+    return out
+
+
+def parse_copilot_chatsessions_jsonl(path: str, target_session: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Parse VS Code chatSessions snapshots/patches into token usage records."""
+
+    records: List[Dict[str, Any]] = []
+    session_id: Optional[str] = None
+    model_hint = "unknown"
+    session_start_hint: Optional[str] = None
+    developer = ""
+
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for idx, line in enumerate(fh, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                obj = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+            kind = obj.get("kind")
+            if kind == 0:
+                v = obj.get("v") or {}
+                session_id = str(v.get("sessionId") or "")
+                session_start_hint = iso_from_millis(v.get("creationDate"))
+                selected_model = safe_get(v, "inputState", "selectedModel") or {}
+                if isinstance(selected_model, dict):
+                    model_hint = canonical_model(
+                        str(safe_get(selected_model, "metadata", "version") or "unknown")
+                    )
+                    developer = str(safe_get(selected_model, "metadata", "auth", "accountLabel") or developer)
+
+                bootstrap_requests = v.get("requests") or []
+                if isinstance(bootstrap_requests, list):
+                    for req_item in bootstrap_requests:
+                        record = _record_from_chatsession_request(
+                            req_item,
+                            idx,
+                            path,
+                            session_id,
+                            model_hint,
+                            target_session,
+                            session_start_hint,
+                            developer,
+                        )
+                        if record:
+                            records.append(record)
+                continue
+
+            if kind != 2:
+                continue
+            k_path = obj.get("k")
+            if not isinstance(k_path, list) or len(k_path) < 1:
+                continue
+            if k_path[0] != "requests" or not (len(k_path) == 1 or isinstance(k_path[1], int)):
+                continue
+            payload = obj.get("v")
+            if not isinstance(payload, list) or len(payload) == 0:
+                continue
+            for req_item in payload:
+                record = _record_from_chatsession_request(
+                    req_item,
+                    idx,
+                    path,
+                    session_id,
+                    model_hint,
+                    target_session,
+                    session_start_hint,
+                    developer,
+                )
+                if record:
+                    records.append(record)
+    return records
+
+
 def session_from_log_records(session_id: str, records: List[Dict[str, Any]], source_logs: List[str]) -> Dict[str, Any]:
     per_model: Dict[str, Dict[str, Any]] = {}
     total_tokens = zero_tokens()
@@ -242,10 +433,18 @@ def session_from_log_records(session_id: str, records: List[Dict[str, Any]], sou
             "usd": usd,
             "credits": usd / CREDIT_USD,
         })
+
+    timestamps = [str(rec.get("timestamp")) for rec in records if rec.get("timestamp")]
+    timestamps.sort()
+    hinted_start = first_non_empty(*(rec.get("session_start_hint") for rec in records))
+    start_time = timestamps[0] if timestamps else hinted_start
+    end_time = timestamps[-1] if timestamps else hinted_start
+
     return {
         "session_id": session_id,
         "source": "raw_log",
         "source_logs": source_logs,
+        "developer": first_non_empty(*(rec.get("developer") for rec in records)),
         "models": models,
         "model_names": ", ".join(m["model"] for m in models),
         "tokens": total_tokens,
@@ -255,6 +454,8 @@ def session_from_log_records(session_id: str, records: List[Dict[str, Any]], sou
         "credits": total_usd / CREDIT_USD,
         "premium_requests": None,
         "responses": sum(m["responses"] for m in models),
+        "start_time": start_time,
+        "end_time": end_time,
     }
 
 

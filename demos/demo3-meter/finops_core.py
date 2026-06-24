@@ -35,10 +35,40 @@ def family(model: str) -> str:
 
 
 def canonical_model(model: str) -> str:
-    model = (model or "unknown").strip()
+    model = (model or "unknown").strip().lower()
+    if model.startswith("copilot/"):
+        model = model.split("/", 1)[1]
     if model.startswith("capi:"):
         model = model.split(":", 2)[1]
     return model.replace(".", "-")
+
+
+def as_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or isinstance(value, bool):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def safe_get(dct: Any, *path: str) -> Any:
+    cur = dct
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
 
 
 def zero_tokens() -> Dict[str, int]:
@@ -216,6 +246,140 @@ def parse_copilot_usage_log(path: str, target_session: Optional[str] = None) -> 
     return records
 
 
+def _record_from_chatsession_request(
+    req_item: Any,
+    idx: int,
+    path: str,
+    session_id: Optional[str],
+    model_hint: str,
+    target_session: Optional[str],
+    developer: str,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(req_item, dict):
+        return None
+    req_session = str(req_item.get("sessionId") or session_id or "")
+    if not req_session:
+        return None
+    if target_session is not None and req_session != target_session:
+        return None
+
+    result = req_item.get("result") or {}
+    metadata = result.get("metadata") or {} if isinstance(result, dict) else {}
+
+    completion_tokens = as_int(
+        first_non_empty(
+            metadata.get("completionTokens"),
+            metadata.get("outputTokens"),
+            req_item.get("completionTokens"),
+            req_item.get("outputTokens"),
+        ),
+        0,
+    )
+    prompt_tokens = as_int(
+        first_non_empty(
+            metadata.get("promptTokens"),
+            metadata.get("inputTokens"),
+            req_item.get("promptTokens"),
+            req_item.get("inputTokens"),
+        ),
+        0,
+    )
+    cache_creation_tokens = as_int(
+        first_non_empty(metadata.get("cacheCreationTokens"), req_item.get("cacheCreationTokens")),
+        0,
+    )
+    cache_read_tokens = as_int(
+        first_non_empty(metadata.get("cacheReadTokens"), req_item.get("cacheReadTokens")),
+        0,
+    )
+
+    if prompt_tokens + completion_tokens + cache_creation_tokens + cache_read_tokens <= 0:
+        return None
+
+    tokens = {
+        "input": prompt_tokens,
+        "output": completion_tokens,
+        "cache_read": cache_read_tokens,
+        "cache_write": cache_creation_tokens,
+    }
+    req_model = canonical_model(
+        str(
+            (req_item.get("agent") or {}).get("model")
+            or req_item.get("modelId")
+            or metadata.get("model")
+            or (req_item.get("metadata") or {}).get("model")
+            or model_hint
+            or "unknown"
+        )
+    )
+    out = {
+        "line": idx,
+        "session_id": req_session,
+        "model": req_model,
+        "tokens": tokens,
+        "nano_aiu": None,
+        "source_log": path,
+        "timestamp": iso_from_millis(req_item.get("timestamp")),
+    }
+    if developer:
+        out["developer"] = developer
+    return out
+
+
+def parse_copilot_chatsessions_jsonl(path: str, target_session: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Parse VS Code chatSessions JSONL snapshots/patches into token records.
+
+    This source is the most reliable for local usage reconstruction and is also
+    where we can extract the signed-in developer account label.
+    """
+
+    records: List[Dict[str, Any]] = []
+    session_id: Optional[str] = None
+    model_hint = "unknown"
+    developer = ""
+
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for idx, line in enumerate(fh, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                obj = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+            kind = obj.get("kind")
+
+            if kind == 0:
+                v = obj.get("v") or {}
+                session_id = str(v.get("sessionId") or "")
+                selected_model = safe_get(v, "inputState", "selectedModel") or {}
+                if isinstance(selected_model, dict):
+                    model_hint = canonical_model(
+                        str(safe_get(selected_model, "metadata", "version") or "unknown")
+                    )
+                    # Most reliable local developer id in available telemetry.
+                    developer = str(safe_get(selected_model, "metadata", "auth", "accountLabel") or developer or "")
+                continue
+
+            if kind == 2:
+                k_path = obj.get("k")
+                if not isinstance(k_path, list) or len(k_path) < 1:
+                    continue
+                if k_path[0] != "requests" or not (len(k_path) == 1 or isinstance(k_path[1], int)):
+                    continue
+                payload = obj.get("v")
+                if not isinstance(payload, list) or len(payload) == 0:
+                    continue
+                for req_item in payload:
+                    record = _record_from_chatsession_request(
+                        req_item, idx, path, session_id, model_hint, target_session, developer
+                    )
+                    if record:
+                        records.append(record)
+    return records
+
+
 def session_from_log_records(session_id: str, records: List[Dict[str, Any]], source_logs: List[str]) -> Dict[str, Any]:
     per_model: Dict[str, Dict[str, Any]] = {}
     total_tokens = zero_tokens()
@@ -246,6 +410,7 @@ def session_from_log_records(session_id: str, records: List[Dict[str, Any]], sou
         "session_id": session_id,
         "source": "raw_log",
         "source_logs": source_logs,
+        "developer": first_non_empty(*(r.get("developer") for r in records)),
         "models": models,
         "model_names": ", ".join(m["model"] for m in models),
         "tokens": total_tokens,

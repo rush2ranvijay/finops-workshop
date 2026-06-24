@@ -110,7 +110,8 @@ design — the second skill captured the work.
 ## Canvas handoff
 
 `dashboard.html` is self-contained (no network deps) and can be wrapped directly as a Copilot canvas.
-The shipped canvas (`.github/extensions/finops-dashboard`) goes further: it serves the page from a
+The shipped canvas (source in `.apm/extensions/finops-dashboard`, installed via `apm install … --target
+copilot` which deploys it to `.github/extensions/finops-dashboard`) goes further: it serves the page from a
 loopback server and renders an **interactive, filterable** view — from/to date, model, and skill (loop)
 filters that recompute cost-by-model, top sessions, windowed skills, and tools entirely client-side from
 the `facts_*` arrays. Skills show the full **window input / cache-read / output** breakdown plus modeled

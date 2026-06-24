@@ -17,7 +17,7 @@ from a browser, and one live demo that meters **your own** Copilot logs. No SaaS
 |---|---|
 | **Present the deck** | Open `docs/index.html` in a browser (← / → to navigate, `F` to present fullscreen). |
 | **Run the cost meter** | `cd demos/demo3-meter && python3 build_db.py && python3 export_dashboard.py && open dashboard.html` |
-| **Show the meter as a Copilot canvas** | Load `.github/extensions/finops-dashboard/` as an extension, then open the **FinOps cost dashboard** canvas. |
+| **Show the meter as a Copilot canvas** | One-time: `apm experimental enable canvas`. Then `apm install danielmeppiel/finops-workshop --target copilot --trust-canvas-extensions`, relaunch Copilot, and open the **FinOps cost dashboard** canvas. |
 | **Facilitate the room** | Read `docs/facilitator-guide.md`. |
 | **Understand the narrative** | Read `deck/deck-spec.md` (the why) and `deck/deck-mockups.md` (slide-by-slide). |
 
@@ -31,11 +31,31 @@ from a browser, and one live demo that meters **your own** Copilot logs. No SaaS
 | `deck/deck-spec.md` | Deck **source of truth**: the spine, the 3 acts, idea-slides + 3 demos, the exact metered hook numbers, and number discipline. |
 | `deck/deck-mockups.md` | One minimalist ASCII mockup per slide — the design intent behind each built slide. |
 | `demos/demo3-meter/` | **Demo 3 — MEASURE.** A stdlib-only meter that turns the Copilot logs you already produce into tokens → AI Units → credits → USD, with sessions-by-cost and skills-by-usage rankings. |
-| `.github/extensions/finops-dashboard/` | A Copilot **canvas** wrapping the Demo 3 dashboard (renders the local snapshot; data stays local). |
+| `.apm/extensions/finops-dashboard/` | The Copilot **canvas** (source of truth) wrapping the Demo 3 dashboard. Shipped via `apm` — `apm install … --target copilot` deploys it into `.github/extensions/` (gitignored as a build artifact). Renders the local snapshot; data stays local. |
 
 ---
 
-## The session at a glance
+## Install the cost dashboard as a Copilot canvas (apm)
+
+The dashboard ships as an [`apm`](https://github.com/microsoft/apm) package, so anyone can install it
+into their own Copilot app — no manual file wiring.
+
+```bash
+# one-time: turn on apm's experimental canvas support
+apm experimental enable canvas
+
+# install this package's canvas into the current project (it's executable Node, hence --trust-canvas-extensions)
+apm install danielmeppiel/finops-workshop --target copilot --trust-canvas-extensions
+```
+
+`apm` deploys the canvas to `.github/extensions/finops-dashboard/` (a generated, gitignored artifact).
+Relaunch the Copilot app (extensions are discovered at session start) and open the **FinOps cost
+dashboard** canvas. With no local snapshot yet it shows a friendly empty-state telling you to run
+`build_db.py` + `export_dashboard.py` — it never shows fabricated cost data.
+
+---
+
+
 
 ```
 Hook(1) → Reframe(2) → Why-not-dev(3) +DEMO1 → Lifecycle loop(4)

@@ -1,0 +1,12 @@
+name: finops-workshop
+version: 0.1.0
+description: FinOps for Agentic Coding — minimalist deck + an empirically-validated Copilot cost meter, shipped as an installable canvas.
+author: danielmeppiel
+# Copilot-only: the canvas under .apm/extensions/ is a GitHub Copilot CLI extension.
+targets:
+- copilot
+dependencies:
+  apm: []
+  mcp: []
+includes: auto
+scripts: {}

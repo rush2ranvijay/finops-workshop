@@ -448,6 +448,45 @@ function renderHtml(data) {
 </html>`;
 }
 
+function emptyStateHtml() {
+    return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FinOps — Copilot cost telemetry</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background: var(--background-color-default,#0d1117); color: var(--text-color-default,#e6edf3);
+    font-family: var(--font-sans,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif); }
+  .wrap { max-width:680px; margin:0 auto; padding:64px 28px; }
+  h1 { font-size: var(--text-title-large,24px); font-weight:600; margin:0 0 6px; }
+  .sub { color: var(--text-color-muted,#8b949e); font-size:13.5px; margin:0 0 22px; line-height:1.55; }
+  .card { background: var(--background-color-muted,#161b22); border:1px solid var(--border-color-default,#30363d);
+    border-radius:12px; padding:18px 20px; margin:0 0 14px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color: var(--text-color-muted,#8b949e); margin:0 0 10px; }
+  pre { margin:0; background: rgba(128,128,128,.10); border-radius:8px; padding:12px 14px; overflow:auto;
+    font-family: var(--font-mono,ui-monospace,SFMono-Regular,Menlo,monospace); font-size:12.5px; line-height:1.7;
+    color: var(--text-color-default,#e6edf3); }
+  .ok { color: var(--true-color-green,#2ea043); }
+  .muted { color: var(--text-color-muted,#8b949e); }
+</style></head>
+<body><div class="wrap">
+  <h1>FinOps cost dashboard</h1>
+  <p class="sub">The canvas is installed and running. There's no local telemetry snapshot to show yet —
+  this dashboard renders <span class="muted">your own</span> Copilot session costs, which stay entirely on this machine.</p>
+  <div class="card">
+    <h2>Generate your snapshot</h2>
+    <pre>cd demos/demo3-meter
+python3 build_db.py        <span class="muted"># parse your local ~/.copilot logs</span>
+python3 export_dashboard.py <span class="muted"># write dashboard_data.json</span></pre>
+  </div>
+  <div class="card">
+    <h2>Then</h2>
+    <pre>Reopen this canvas (or run the <span class="ok">refresh</span> action).</pre>
+  </div>
+  <p class="sub muted">No data leaves your machine. The snapshot is gitignored by design.</p>
+</div></body></html>`;
+}
+
 async function startServer(instanceId) {
     let cached = null;
     const server = createServer(async (req, res) => {
@@ -467,7 +506,16 @@ async function startServer(instanceId) {
                 res.end(JSON.stringify(payload));
                 return;
             }
-            if (!cached) cached = renderHtml(await loadData());
+            let data;
+            try {
+                data = await loadData();
+            } catch {
+                // No local snapshot yet — serve a friendly empty-state, never a 500.
+                res.setHeader("Content-Type", "text/html; charset=utf-8");
+                res.end(emptyStateHtml());
+                return;
+            }
+            if (!cached) cached = renderHtml(data);
             res.setHeader("Content-Type", "text/html; charset=utf-8");
             res.end(cached);
         } catch (err) {

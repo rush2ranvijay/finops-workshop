@@ -10,6 +10,9 @@ __pycache__/
 .venv/
 venv/
 
+# apm — installed dependency tree (created by `apm install`)
+apm_modules/
+
 # OS
 .DS_Store
 
@@ -19,5 +22,8 @@ demos/demo3-meter/EVIDENCE.md
 demos/demo3-meter/*_b44.json
 demos/demo3-meter/testdata/
 
-# Canvas extension local data copy — personal telemetry, never commit
-.github/extensions/finops-dashboard/dashboard_data.json
+# Canvas source of truth lives in .apm/extensions/finops-dashboard/ (shipped via apm).
+# `apm install --target copilot` DEPLOYS it here — that copy is a generated artifact.
+.github/extensions/finops-dashboard/
+# Local telemetry snapshot dropped next to the deployed/dev canvas — never commit.
+.apm/extensions/finops-dashboard/dashboard_data.json

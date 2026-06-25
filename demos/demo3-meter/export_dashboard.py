@@ -57,11 +57,13 @@ def load_titles():
 
 def main() -> int:
     conn = sqlite3.connect(DB_PATH)
-    meta = {r["key"]: json.loads(r["value"]) for r in rows(conn, "SELECT key, value FROM etl_metadata")}
     top_sessions = rows(
         conn,
         """
-        SELECT session_id, SUBSTR(start_time, 1, 10) AS start_date, models, total_tokens, aiu, usd, credits
+        SELECT session_id,
+               developer,
+               SUBSTR(COALESCE(NULLIF(end_time, ''), NULLIF(start_time, '')), 1, 10) AS start_date,
+               models, total_tokens, aiu, usd, credits
         FROM sessions
         WHERE usd > 0
         ORDER BY usd DESC
@@ -146,6 +148,20 @@ def main() -> int:
         FROM sessions
         """,
     )[0]
+    by_developer = rows(
+        conn,
+        """
+        SELECT COALESCE(NULLIF(developer, ''), '(unknown)') AS developer,
+               COUNT(*) AS sessions,
+               SUM(total_tokens) AS total_tokens,
+               SUM(tool_call_count) AS tool_call_count,
+               SUM(usd) AS usd,
+               SUM(credits) AS credits
+        FROM sessions
+        GROUP BY COALESCE(NULLIF(developer, ''), '(unknown)')
+        ORDER BY usd DESC, sessions DESC
+        """,
+    )
 
     # ---- Granular facts for client-side filtering (date / model / skill) ----
     # Per (session, model) metered rows, tagged with the session's calendar day.
@@ -226,6 +242,7 @@ def main() -> int:
         "method_note": "Session/model dollars are METERED. Skill window_output_tokens are MEASURED (assistant output while the skill is in context, summed per model incl. subagents on other models). Windows open at skill.invoked and close at the next HUMAN turn or session end (never at the next skill.invoked), so they may overlap. window_input/cache/usd/credits are MODELED: metered per-model session totals apportioned by the window's output share, denominator max(metered_output, sum_window_output) so the parts never exceed the metered whole. Tools are ranked by usage.",
         "summary": summary,
         "per_model": per_model,
+        "by_developer": by_developer,
         "top_sessions": top_sessions,
         "top_skills": top_skills,
         "top_tools": top_tools,
@@ -275,6 +292,7 @@ td {{ border-bottom:1px solid #f1f5f9; padding:8px; vertical-align:middle; }}
 <h1>Demo 3 — MEASURE your own Copilot cost</h1>
 <div class=\"sub\" id=\"generated\"></div>
 <div class=\"cards\" id=\"cards\"></div>
+<section><h2>Cost by developer</h2><div id=\"developers\"></div><div class=\"note\"><b>Measured</b> — developer comes from VS Code chatSessions auth account label (<code>inputState.selectedModel.metadata.auth.accountLabel</code>). Sessions without chatSessions attribution show as <code>(unknown)</code>.</div></section>
 <section><h2>Per-model totals</h2><div id=\"models\"></div><div class=\"note\"><b>Measured</b> — totals come from <code>session.shutdown.data.modelMetrics</code> / <code>session_models</code>.</div></section>
 <section><h2>Top sessions by cost</h2><div id=\"sessions\"></div><div class=\"note\"><b>Measured</b> — session USD/credits come from real per-session model token telemetry (input/output/cache).</div></section>
 <section><h2>Skill windows</h2><div id=\"skills\"></div><div class=\"note\"><b>Calls, sessions, and window output tokens are measured</b> from real <code>skill.invoked</code> and <code>assistant.message.outputTokens</code> events. <b>Window USD is an estimate</b>: each skill window runs from invocation to the next user message or next skill invocation, then receives that model's metered session USD by output-token share when measured window output fits the metered model pool. If not, dollars are left unmodeled rather than over-allocated. Per-message input/cache/cost are absent, so true per-skill dollars are not directly meterable.</div></section>
@@ -297,8 +315,14 @@ const cards = [
 document.getElementById('cards').innerHTML = cards.map(([l,v]) => `<div class=card><div class=label>${{l}}</div><div class=value>${{v}}</div></div>`).join('');
 function renderSessions() {{
  const max = Math.max(...data.top_sessions.map(r => r.usd||0), 1);
- return `<table><thead><tr><th>Session</th><th>Date</th><th>Model(s)</th><th class=num>Credits</th><th class=num>USD</th><th class=num>Tokens</th><th class=num>AIU</th><th>Cost bar</th></tr></thead><tbody>` +
- data.top_sessions.map(r => `<tr><td title="${{r.session_id}}">${{r.title?r.title:short(r.session_id)}}<div class=sid>${{short(r.session_id)}}</div></td><td>${{r.start_date||'—'}}</td><td>${{r.models||'—'}}</td><td class=num>${{fmtCredits(r.credits)}}</td><td class=num>${{fmtMoney(r.usd)}}</td><td class=num>${{fmtInt(r.total_tokens)}}</td><td class=num>${{r.aiu==null?'—':Number(r.aiu).toFixed(3)}}</td><td class=barcell><div class=bar><div class=fill style="width:${{100*(r.usd||0)/max}}%"></div></div></td></tr>`).join('') + `</tbody></table>`;
+ return `<table><thead><tr><th>Session</th><th>Developer</th><th>Date</th><th>Model(s)</th><th class=num>Credits</th><th class=num>USD</th><th class=num>Tokens</th><th class=num>AIU</th><th>Cost bar</th></tr></thead><tbody>` +
+ data.top_sessions.map(r => `<tr><td title="${{r.session_id}}">${{r.title?r.title:short(r.session_id)}}<div class=sid>${{short(r.session_id)}}</div></td><td>${{r.developer||'—'}}</td><td>${{r.start_date||'—'}}</td><td>${{r.models||'—'}}</td><td class=num>${{fmtCredits(r.credits)}}</td><td class=num>${{fmtMoney(r.usd)}}</td><td class=num>${{fmtInt(r.total_tokens)}}</td><td class=num>${{r.aiu==null?'—':Number(r.aiu).toFixed(3)}}</td><td class=barcell><div class=bar><div class=fill style="width:${{100*(r.usd||0)/max}}%"></div></div></td></tr>`).join('') + `</tbody></table>`;
+}}
+function renderDevelopers() {{
+ if (!data.by_developer || !data.by_developer.length) return '<div class=note>No developer attribution available.</div>';
+ const max = Math.max(...data.by_developer.map(r => r.usd||0), 1);
+ return `<table><thead><tr><th>Developer</th><th class=num>Sessions</th><th class=num>Tokens</th><th class=num>Tool calls</th><th class=num>Credits</th><th class=num>USD</th><th>Cost bar</th></tr></thead><tbody>` +
+ data.by_developer.map(r => `<tr><td>${{r.developer}}</td><td class=num>${{fmtInt(r.sessions)}}</td><td class=num>${{fmtInt(r.total_tokens)}}</td><td class=num>${{fmtInt(r.tool_call_count)}}</td><td class=num>${{fmtCredits(r.credits)}}</td><td class=num>${{fmtMoney(r.usd)}}</td><td class=barcell><div class=bar><div class=fill style="width:${{100*(r.usd||0)/max}}%"></div></div></td></tr>`).join('') + `</tbody></table>`;
 }}
 function renderModels() {{
  if (!data.per_model || !data.per_model.length) return '<div class=note>No metered model rows recorded.</div>';
@@ -317,6 +341,7 @@ function renderTools() {{
  data.top_tools.map(r => `<tr><td>${{r.tool_name}}</td><td class=num>${{fmtInt(r.invocation_count)}}</td><td class=num>${{fmtInt(r.sessions)}}</td><td class=num>${{fmtMoney(r.session_usd_touched)}}</td><td class=barcell><div class=bar><div class=fill style="width:${{100*(r.invocation_count||0)/max}}%"></div></div></td></tr>`).join('') + `</tbody></table>`;
 }}
 document.getElementById('models').innerHTML = renderModels();
+document.getElementById('developers').innerHTML = renderDevelopers();
 document.getElementById('sessions').innerHTML = renderSessions();
 document.getElementById('skills').innerHTML = renderSkills();
 document.getElementById('tools').innerHTML = renderTools();
